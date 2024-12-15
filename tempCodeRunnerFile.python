@@ -1,0 +1,221 @@
+import numpy as np
+import scipy.io
+from scipy.spatial.distance import cosine
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.decomposition import IncrementalPCA
+from concurrent.futures import ThreadPoolExecutor
+import matplotlib.pyplot as plt
+import pywt
+
+def align_shapes(*arrays):
+    """
+    Align the shapes of multiple arrays by trimming them to the smallest dimensions.
+
+    Parameters:
+        *arrays: Tuple of numpy arrays to align.
+
+    Returns:
+        Tuple of numpy arrays with aligned shapes.
+    """
+    min_rows = min(array.shape[0] for array in arrays)
+    min_cols = min(array.shape[1] for array in arrays)
+    aligned_arrays = tuple(array[:min_rows, :min_cols] for array in arrays)
+    return aligned_arrays
+
+def load_data(file_path):
+    try:
+        data = scipy.io.loadmat(file_path)
+        if 'img' not in data or 'map' not in data:
+            raise KeyError("The .mat file must contain 'img' and 'map'.")
+        return align_shapes(data['img'], data['map'])
+    except Exception as e:
+        raise ValueError(f"Error loading data from {file_path}: {e}")
+
+def spectral_angle_mapper(img_data, target_spectrum):
+    if np.linalg.norm(target_spectrum) == 0:
+        raise ValueError("Target spectrum is invalid (zero vector).")
+    height, width, bands = img_data.shape
+    img_flattened = img_data.reshape(-1, bands)
+    target_normalized = target_spectrum / np.linalg.norm(target_spectrum)
+    cos_angles = np.array([1 - cosine(pix, target_normalized) for pix in img_flattened])
+    return cos_angles.reshape(height, width)
+
+def mutual_info_band_selection(img_data, labels, n_bands=10):
+    reshaped_data = img_data.reshape(-1, img_data.shape[2])
+    mi_scores = mutual_info_classif(reshaped_data, labels)
+    top_band_indices = np.argsort(mi_scores)[-n_bands:]
+    return img_data[:, :, top_band_indices], top_band_indices
+
+def restrict_to_band_range(img_data, band_indices, ranges):
+    filtered_indices = []
+    for start, end in ranges:
+        filtered_indices.extend([idx for idx in band_indices if start <= idx <= end])
+    return img_data[:, :, filtered_indices], filtered_indices
+
+def remove_low_variance_bands(img_data, threshold=0.01):
+    band_variances = np.var(img_data, axis=(0, 1))
+    selected_bands = np.where(band_variances > threshold)[0]
+    reduced_img = img_data[:, :, selected_bands]
+    print(f"Selected {len(selected_bands)} bands after removing low-variance bands.")
+    return reduced_img, selected_bands
+
+def wavelet_denoise_parallel(img_data, wavelet='db1', level=1, threshold=0.1):
+    def denoise_band(band_data):
+        coeffs = pywt.wavedec2(band_data, wavelet, level=level)
+        coeffs_thresholded = [
+            tuple(pywt.threshold(c, threshold, mode='soft') for c in details) if i > 0 else details
+            for i, details in enumerate(coeffs)
+        ]
+        return pywt.waverec2(coeffs_thresholded, wavelet)
+
+    denoised_bands = []
+    with ThreadPoolExecutor() as executor:
+        results = executor.map(denoise_band, [img_data[:, :, i] for i in range(img_data.shape[2])])
+        for denoised_band in results:
+            aligned_band = denoised_band[:img_data.shape[0], :img_data.shape[1]]
+            denoised_bands.append(aligned_band)
+
+    denoised_img = np.stack(denoised_bands, axis=-1)
+    return denoised_img
+
+def radiometric_correction(img_data, gain=1, offset=0):
+    corrected_img = (img_data * gain) + offset
+    print("Radiometric correction applied.")
+    return corrected_img
+
+def atmospheric_correction(img_data):
+    dark_object_value = np.min(img_data, axis=(0, 1))
+    corrected_img = img_data - dark_object_value
+    corrected_img[corrected_img < 0] = 0
+    print("Atmospheric correction applied using Dark Object Subtraction.")
+    return corrected_img
+
+def apply_incremental_pca(img_data, n_components=10, batch_size=1000):
+    reshaped_data = img_data.reshape(-1, img_data.shape[2]).astype(np.float32)
+    ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
+    try:
+        pca_data = ipca.fit_transform(reshaped_data)
+    except MemoryError:
+        print("MemoryError during PCA. Reduce batch_size.")
+        return None
+
+    print(f"PCA completed. Explained variance ratio: {ipca.explained_variance_ratio_}")
+    pca_img = ipca.inverse_transform(pca_data).reshape(img_data.shape)
+    return pca_img
+
+def calculate_snr(img_data):
+    mean_signal = np.mean(img_data, axis=(0, 1))
+    noise = img_data - mean_signal
+    snr = mean_signal / (np.std(noise, axis=(0, 1)) + 1e-10)
+    print(f"Signal-to-Noise Ratio (SNR) calculated for each band.")
+    return snr
+
+def mnf_transform(img_data, n_components=10):
+    reshaped_data = img_data.reshape(-1, img_data.shape[2])
+    cov = np.cov(reshaped_data, rowvar=False)
+    eig_vals, eig_vecs = np.linalg.eigh(cov)
+    indices = np.argsort(eig_vals)[-n_components:][::-1]
+    mnf_img = np.dot(reshaped_data, eig_vecs[:, indices])
+    mnf_img = mnf_img.reshape(img_data.shape[0], img_data.shape[1], n_components)
+    print(f"MNF transformation applied with {n_components} components.")
+    return mnf_img
+
+def spectral_fusion(img1, img2):
+    fused_img = (img1 + img2) / 2
+    print("Spectral fusion applied.")
+    return fused_img
+
+def refine_band_selection(img_data, map_data, target_pixel=(50, 50), n_bands=10):
+    target_spectrum = img_data[target_pixel[0], target_pixel[1], :]
+    sam_result = spectral_angle_mapper(img_data, target_spectrum)
+
+    plt.figure()
+    plt.imshow(sam_result, cmap='jet')
+    plt.title("Spectral Angle Mapper (SAM) Result")
+    plt.colorbar()
+    plt.show()
+
+    anomaly_threshold = np.percentile(sam_result, 95)
+    labels = (sam_result > anomaly_threshold).astype(int).flatten()
+
+    selected_img, selected_bands = mutual_info_band_selection(img_data, labels, n_bands=n_bands)
+
+    spectral_ranges = [(0, 32), (150, 200)]
+    selected_img, refined_bands = restrict_to_band_range(img_data, selected_bands, spectral_ranges)
+
+    print(f"Top {n_bands} bands within ranges selected: {refined_bands}")
+
+    plt.figure(figsize=(10, 5))
+    for i, band in enumerate(refined_bands):
+        plt.subplot(1, len(refined_bands), i + 1)
+        plt.imshow(img_data[:, :, band], cmap='gray')
+        plt.title(f"Band {band}")
+    plt.tight_layout()
+    plt.show()
+
+    return selected_img, refined_bands
+
+def clean_and_process_data(file_path):
+    try:
+        img_data, map_data = load_data(file_path)
+        print("Data loaded successfully.")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
+
+    try:
+        reduced_img, selected_bands = remove_low_variance_bands(img_data)
+    except Exception as e:
+        print(f"Error during low variance band removal: {e}")
+        return
+
+    try:
+        radiometric_img = radiometric_correction(reduced_img)
+        atmos_corrected_img = atmospheric_correction(radiometric_img)
+    except Exception as e:
+        print(f"Error during correction steps: {e}")
+        return
+
+    try:
+        pca_img = apply_incremental_pca(atmos_corrected_img, n_components=30, batch_size=10000)
+        print("Incremental PCA applied.")
+    except Exception as e:
+        print(f"Error during PCA: {e}")
+        return
+
+    try:
+        denoised_img = wavelet_denoise_parallel(pca_img, wavelet='db2', level=2, threshold=0.2)
+        print("Wavelet denoising applied.")
+    except Exception as e:
+        print(f"Error during wavelet denoising: {e}")
+        return
+
+    try:
+        snr = calculate_snr(denoised_img)
+        print(f"SNR values: {snr}")
+    except Exception as e:
+        print(f"Error during SNR calculation: {e}")
+        return
+
+    try:
+        mnf_img = mnf_transform(denoised_img, n_components=15)
+        print("MNF transformation applied.")
+    except Exception as e:
+        print(f"Error during MNF transformation: {e}")
+        return
+
+    try:
+        selected_img, refined_bands = refine_band_selection(mnf_img, map_data)
+        print("Refined band selection completed.")
+    except Exception as e:
+        print(f"Error during band refinement: {e}")
+        return
+
+    print("Data cleaning and processing completed successfully.")
+    return selected_img, refined_bands
+
+# Example of specifying the file path
+file_path =  r"C:\_Vignesh_N\1_six_avengers_final\Hyper1.mat"  # Replace with your actual file path
+
+# Call the function to clean and process the data
+selected_img, refined_bands = clean_and_process_data(file_path)
